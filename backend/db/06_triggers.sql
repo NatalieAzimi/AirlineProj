@@ -1,67 +1,264 @@
+
+
 USE airlineschema;
 
 DELIMITER $$
 
--- =========================================================
--- TRIGGER 1 (NEW): decrement inventory when a segment is booked
--- (Plan step 4 + Constraint 12 lower bound)
--- =========================================================
-DROP TRIGGER IF EXISTS trg_segment_book_decrement_inventory $$
-CREATE TRIGGER trg_segment_book_decrement_inventory
+-- Remove the old inventory triggers.
+DROP TRIGGER IF EXISTS trg_segment_book_decrement_inventory$$
+DROP TRIGGER IF EXISTS trg_segment_cancel_restore_inventory$$
+DROP TRIGGER IF EXISTS trg_segment_change_restore_inventory$$
+
+-- Remove any earlier versions of these new triggers.
+DROP TRIGGER IF EXISTS trg_segment_inventory_insert$$
+DROP TRIGGER IF EXISTS trg_segment_inventory_update$$
+DROP TRIGGER IF EXISTS trg_segment_inventory_delete$$
+DROP TRIGGER IF EXISTS trg_passenger_inventory_insert$$
+DROP TRIGGER IF EXISTS trg_passenger_inventory_delete$$
+DROP TRIGGER IF EXISTS trg_passenger_inventory_update$$
+
+-- =====================================================
+-- TRIGGER 1: Reduce inventory when booking a segment.
+-- One seat is required for each reservation passenger.
+-- =====================================================
+CREATE TRIGGER trg_segment_inventory_insert
 BEFORE INSERT ON ReservationSegment
 FOR EACH ROW
 BEGIN
-    DECLARE v_inv INT;
-    IF NEW.segment_status = 'Booked' THEN
-        SELECT available_inventory INTO v_inv
-          FROM FlightFare
-         WHERE flight_fare_id = NEW.flight_fare_id
-         FOR UPDATE;
+    DECLARE passenger_count INT DEFAULT 0;
+    DECLARE fare_flight_id INT DEFAULT NULL;
 
-        IF v_inv <= 0 THEN
+    IF NEW.segment_status = 'Booked' THEN
+
+        SELECT COUNT(*) INTO passenger_count
+        FROM ReservationPassenger
+        WHERE reservation_id = NEW.reservation_id;
+
+        IF passenger_count = 0 THEN
             SIGNAL SQLSTATE '45000'
-                SET MESSAGE_TEXT = 'Cannot book: fare inventory exhausted.';
+            SET MESSAGE_TEXT =
+                'Cannot book a segment without passengers.';
+        END IF;
+
+        SELECT flight_id INTO fare_flight_id
+        FROM FlightFare
+        WHERE flight_fare_id = NEW.flight_fare_id;
+
+        IF fare_flight_id IS NULL
+           OR fare_flight_id <> NEW.flight_id THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT =
+                'FlightFare does not match the selected flight.';
         END IF;
 
         UPDATE FlightFare
-           SET available_inventory = available_inventory - 1
-         WHERE flight_fare_id = NEW.flight_fare_id;
+        SET available_inventory =
+            available_inventory - passenger_count
+        WHERE flight_fare_id = NEW.flight_fare_id
+          AND available_inventory >= passenger_count;
+
+        IF ROW_COUNT() <> 1 THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT =
+                'Not enough available seats for all passengers.';
+        END IF;
     END IF;
 END$$
 
--- =========================================================
--- TRIGGER 2: restore inventory when a segment is cancelled
--- (Business Rule 3)
--- =========================================================
-DROP TRIGGER IF EXISTS trg_segment_cancel_restore_inventory $$
-CREATE TRIGGER trg_segment_cancel_restore_inventory
-AFTER UPDATE ON ReservationSegment
+
+-- =====================================================
+-- TRIGGER 2: Handle cancellations, rebooking,
+-- and changes to the selected fare or flight.
+-- =====================================================
+CREATE TRIGGER trg_segment_inventory_update
+BEFORE UPDATE ON ReservationSegment
 FOR EACH ROW
 BEGIN
-    IF NEW.segment_status = 'Cancelled'
-       AND OLD.segment_status <> 'Cancelled' THEN
+    DECLARE passenger_count INT DEFAULT 0;
+    DECLARE fare_flight_id INT DEFAULT NULL;
+
+    IF NEW.reservation_id <> OLD.reservation_id THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT =
+            'Moving a segment to another reservation is not allowed.';
+    END IF;
+
+    IF OLD.segment_status = 'Flown'
+       AND (NEW.segment_status <> 'Flown'
+            OR NEW.flight_fare_id <> OLD.flight_fare_id
+            OR NEW.flight_id <> OLD.flight_id) THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT =
+            'A flown segment cannot be changed or cancelled.';
+    END IF;
+    IF OLD.segment_status = 'Cancelled'
+   AND NEW.segment_status = 'Flown' THEN
+    SIGNAL SQLSTATE '45000'
+    SET MESSAGE_TEXT =
+        'A cancelled segment cannot be marked as flown.';
+END IF;
+
+    SELECT COUNT(*) INTO passenger_count
+    FROM ReservationPassenger
+    WHERE reservation_id = OLD.reservation_id;
+
+    -- If an active booking is cancelled, changed, or
+    -- moved to another fare, release its old inventory.
+    IF OLD.segment_status = 'Booked'
+   AND (NEW.segment_status IN ('Cancelled', 'Changed')
+        OR (NEW.segment_status = 'Booked'
+            AND NEW.flight_fare_id <> OLD.flight_fare_id)) THEN
+
+   UPDATE FlightFare
+SET available_inventory =
+    available_inventory + passenger_count
+WHERE flight_fare_id = OLD.flight_fare_id
+  AND available_inventory + passenger_count
+      <= allocated_capacity;
+
+IF ROW_COUNT() <> 1 THEN
+    SIGNAL SQLSTATE '45000'
+    SET MESSAGE_TEXT =
+        'Cannot restore inventory: capacity exceeded.';
+END IF;
+END IF;
+    -- If a segment becomes booked, or its fare changes,
+    -- reserve inventory for all passengers.
+    IF NEW.segment_status = 'Booked'
+       AND (OLD.segment_status <> 'Booked'
+            OR NEW.flight_fare_id <> OLD.flight_fare_id) THEN
+
+        IF passenger_count = 0 THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT =
+                'Cannot book a segment without passengers.';
+        END IF;
+
+        SELECT flight_id INTO fare_flight_id
+        FROM FlightFare
+        WHERE flight_fare_id = NEW.flight_fare_id;
+
+        IF fare_flight_id IS NULL
+           OR fare_flight_id <> NEW.flight_id THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT =
+                'FlightFare does not match the selected flight.';
+        END IF;
+
         UPDATE FlightFare
-           SET available_inventory = available_inventory + 1
-         WHERE flight_fare_id = NEW.flight_fare_id;
+        SET available_inventory =
+            available_inventory - passenger_count
+        WHERE flight_fare_id = NEW.flight_fare_id
+          AND available_inventory >= passenger_count;
+
+        IF ROW_COUNT() <> 1 THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT =
+                'Not enough seats for the new booking.';
+        END IF;
+    END IF;
+
+    -- The flight must match the fare for other statuses too.
+    SELECT flight_id INTO fare_flight_id
+    FROM FlightFare
+    WHERE flight_fare_id = NEW.flight_fare_id;
+
+    IF fare_flight_id IS NULL
+       OR fare_flight_id <> NEW.flight_id THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT =
+            'FlightFare does not match the selected flight.';
     END IF;
 END$$
 
--- =========================================================
--- TRIGGER 3 (NEW): restore inventory when a segment is changed
--- (Business Rule 9 support)
--- =========================================================
-DROP TRIGGER IF EXISTS trg_segment_change_restore_inventory $$
-CREATE TRIGGER trg_segment_change_restore_inventory
-AFTER UPDATE ON ReservationSegment
+
+-- =====================================================
+-- TRIGGER 3: Restore inventory if a booked segment
+-- is deleted directly.
+-- =====================================================
+CREATE TRIGGER trg_segment_inventory_delete
+BEFORE DELETE ON ReservationSegment
 FOR EACH ROW
 BEGIN
-    IF NEW.segment_status = 'Changed'
-       AND OLD.segment_status = 'Booked' THEN
-        UPDATE FlightFare
-           SET available_inventory = available_inventory + 1
-         WHERE flight_fare_id = NEW.flight_fare_id;
+    DECLARE passenger_count INT DEFAULT 0;
+
+    IF OLD.segment_status = 'Booked' THEN
+
+        SELECT COUNT(*) INTO passenger_count
+        FROM ReservationPassenger
+        WHERE reservation_id = OLD.reservation_id;
+
+    UPDATE FlightFare
+SET available_inventory =
+    available_inventory + passenger_count
+WHERE flight_fare_id = OLD.flight_fare_id
+  AND available_inventory + passenger_count
+      <= allocated_capacity;
+
+IF ROW_COUNT() <> 1 THEN
+    SIGNAL SQLSTATE '45000'
+    SET MESSAGE_TEXT =
+        'Cannot restore inventory: capacity exceeded.';
+END IF;
+END IF;
+END$$
+
+
+-- =====================================================
+-- TRIGGERS 4-6: Prevent passenger-list edits after
+-- segments exist. This keeps inventory counts accurate.
+-- Create all passengers before creating segments.
+-- =====================================================
+CREATE TRIGGER trg_passenger_inventory_insert
+BEFORE INSERT ON ReservationPassenger
+FOR EACH ROW
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM ReservationSegment
+        WHERE reservation_id = NEW.reservation_id
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT =
+            'Add passengers before booking flight segments.';
     END IF;
 END$$
+
+CREATE TRIGGER trg_passenger_inventory_delete
+BEFORE DELETE ON ReservationPassenger
+FOR EACH ROW
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM ReservationSegment
+        WHERE reservation_id = OLD.reservation_id
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT =
+            'Remove flight segments before deleting passengers.';
+    END IF;
+END$$
+
+CREATE TRIGGER trg_passenger_inventory_update
+BEFORE UPDATE ON ReservationPassenger
+FOR EACH ROW
+BEGIN
+    IF NEW.reservation_id <> OLD.reservation_id
+       AND (
+           EXISTS (
+               SELECT 1 FROM ReservationSegment
+               WHERE reservation_id = OLD.reservation_id
+           )
+           OR EXISTS (
+               SELECT 1 FROM ReservationSegment
+               WHERE reservation_id = NEW.reservation_id
+           )
+       ) THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT =
+            'Cannot move passengers after segments are booked.';
+    END IF;
+END$$
+
+
 
 -- =========================================================
 -- TRIGGER 4 (NEW): supervisor-only refunds
@@ -154,4 +351,172 @@ BEGIN
     END IF;
 END$$
 
+-- =====================================================
+-- TRIGGER 10: Release seats when a segment is cancelled
+-- or changed, while keeping assignment history.
+-- =====================================================
+DROP TRIGGER IF EXISTS trg_segment_release_seats$$
+
+CREATE TRIGGER trg_segment_release_seats
+AFTER UPDATE ON ReservationSegment
+FOR EACH ROW
+BEGIN
+    IF OLD.segment_status = 'Booked'
+       AND NEW.segment_status IN ('Cancelled', 'Changed') THEN
+
+        UPDATE SeatAssignment
+        SET active_seat = NULL
+        WHERE reservation_segment_id = NEW.reservation_segment_id
+          AND active_seat = 1;
+
+    END IF;
+END$$
+
+
+-- =====================================================
+-- TRIGGER 11: Validate new seat assignments.
+-- =====================================================
+DROP TRIGGER IF EXISTS trg_seat_assignment_validate_insert$$
+
+CREATE TRIGGER trg_seat_assignment_validate_insert
+BEFORE INSERT ON SeatAssignment
+FOR EACH ROW
+BEGIN
+    DECLARE segment_reservation INT DEFAULT NULL;
+    DECLARE segment_status_value VARCHAR(20);
+
+    SELECT reservation_id, segment_status
+    INTO segment_reservation, segment_status_value
+    FROM ReservationSegment
+    WHERE reservation_segment_id = NEW.reservation_segment_id;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM ReservationPassenger
+        WHERE reservation_passenger_id = NEW.reservation_passenger_id
+          AND reservation_id = segment_reservation
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT =
+            'Passenger does not belong to this reservation.';
+    END IF;
+
+    IF NEW.active_seat = 1
+       AND (segment_status_value IS NULL
+            OR segment_status_value <> 'Booked') THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT =
+            'Active seats require a booked segment.';
+    END IF;
+END$$
+
+
+
+-- =====================================================
+-- TRIGGER 12: Validate updates to seat assignments.
+-- =====================================================
+DROP TRIGGER IF EXISTS trg_seat_assignment_validate_update$$
+
+CREATE TRIGGER trg_seat_assignment_validate_update
+BEFORE UPDATE ON SeatAssignment
+FOR EACH ROW
+BEGIN
+    DECLARE segment_reservation INT DEFAULT NULL;
+    DECLARE segment_status_value VARCHAR(20);
+    DECLARE seat_aircraft INT DEFAULT NULL;
+    DECLARE flight_aircraft INT DEFAULT NULL;
+
+    -- Find the reservation and status of the segment.
+    SELECT reservation_id, segment_status
+    INTO segment_reservation, segment_status_value
+    FROM ReservationSegment
+    WHERE reservation_segment_id =
+          NEW.reservation_segment_id;
+
+    -- Passenger must belong to the reservation.
+    IF NOT EXISTS (
+        SELECT 1
+        FROM ReservationPassenger
+        WHERE reservation_passenger_id =
+              NEW.reservation_passenger_id
+          AND reservation_id = segment_reservation
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT =
+            'Passenger does not belong to this reservation.';
+    END IF;
+
+    -- Active seats require a booked segment.
+    -- Permit releasing an assignment on a cancelled
+    -- or changed segment.
+    IF NEW.active_seat = 1
+       AND (
+           segment_status_value IS NULL
+           OR segment_status_value <> 'Booked'
+       ) THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT =
+            'Active seats require a booked segment.';
+    END IF;
+
+    -- Validate the aircraft when changing or activating
+    -- a seat. Historical released records remain unchanged.
+    IF NEW.active_seat = 1
+       AND (
+           NEW.seat_id <> OLD.seat_id
+           OR NEW.reservation_segment_id <>
+              OLD.reservation_segment_id
+           OR OLD.active_seat IS NULL
+       ) THEN
+
+        SELECT aircraft_id
+        INTO seat_aircraft
+        FROM Seat
+        WHERE seat_id = NEW.seat_id;
+
+        SELECT f.aircraft_id
+        INTO flight_aircraft
+        FROM ReservationSegment rs
+        JOIN Flight f ON f.flight_id = rs.flight_id
+        WHERE rs.reservation_segment_id =
+              NEW.reservation_segment_id;
+
+        IF seat_aircraft IS NULL
+           OR flight_aircraft IS NULL
+           OR seat_aircraft <> flight_aircraft THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT =
+                'Seat does not belong to the aircraft operating this segment.';
+        END IF;
+    END IF;
+END$$
+
+
+
+-- =====================================================
+-- TRIGGER 13: Prevent cancelling a reservation
+-- while it still contains booked flight segments.
+-- =====================================================
+DROP TRIGGER IF EXISTS trg_reservation_cancel_check$$
+
+CREATE TRIGGER trg_reservation_cancel_check
+BEFORE UPDATE ON Reservation
+FOR EACH ROW
+BEGIN
+    IF NEW.reservation_status = 'Cancelled'
+       AND OLD.reservation_status <> 'Cancelled'
+       AND EXISTS (
+           SELECT 1
+           FROM ReservationSegment
+           WHERE reservation_id = NEW.reservation_id
+             AND segment_status = 'Booked'
+       ) THEN
+
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT =
+            'Cancel booked flight segments before cancelling reservation.';
+    END IF;
+END$$
+
 DELIMITER ;
+
